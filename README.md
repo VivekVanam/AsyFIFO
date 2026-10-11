@@ -593,4 +593,6 @@ The wait in step 2 is there to model memory read latency. In a registered-read m
 - *The wait matches a registered read, but the active read is combinational.* With `assign data_out = fifo[b_rptr[...]]`, the accepting edge has already moved `b_rptr` by the time the `#1` expires, so the sampled `data_out` is the word *after* the one just read. Either restore the registered-read block in `fifo_mem.v` (which the one-clock delay was written for) or, for the combinational read, compare `data_out` at the accepting edge, before the pointer moves.
 - *The testbench never holds `w_en` high through a sustained full condition.* The write loop checks `!full` before every pulse, so the FIFO's own overflow guard (`w_en & !full` inside `wptr_handler` and `fifo_mem`) is at most touched for a single edge by this stimulus. Holding `w_en` high while `full` is asserted, and likewise `r_en` while `empty` is asserted, is what proves those guards.
 
-I could not run a simulator when preparing this README, so the findings above are from reading the source; confirm them in your own simulation. The run ends with `[TEST COMPLETE] Validation sequence ended.` followed by `$finish`; the testbench has no summary counter and no watchdog, so scan the log for `ERROR` lines.
+### `Simulation`
+
+<img width="1062" height="366" alt="image" src="https://github.com/user-attachments/assets/0f652080-8161-46f3-8974-ba2a317a709b" />
