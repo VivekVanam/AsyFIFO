@@ -91,19 +91,10 @@ A parameterized asynchronous FIFO that moves data between two unrelated clock do
 
 Deassertion is delayed and assertion is immediate. Each side sees a slightly stale copy of the other side's pointer, which can only make the FIFO look fuller (to the writer) or emptier (to the reader) than it really is. The error is always in the safe direction.
 
-### Build and run
+### Asynchronous FIFO Block Diagram
 
-All six source files are required; none of the `` `include `` lines in `asynchronous_fifo.v` is active. Icarus Verilog is shown as an example; in Vivado, add the six files as sources and set `async_fifo_TB` as the simulation top. The testbench writes `dump.vcd`.
+<img width="1024" height="578" alt="asynchronous-fifo-1024x578" src="https://github.com/user-attachments/assets/1514fc9f-5a33-43c7-b5bf-198fec3a54fe" />
 
-```bash
-iverilog -g2012 -Wall -o async_fifo_sim \
-    fifo_mem.v synchronizer.v wptr_handler.v rptr_handler.v \
-    asynchronous_fifo.v async_fifo_TB.v
-vvp async_fifo_sim
-gtkwave dump.vcd
-```
-
----
 
 ## 2. Design Files
 
