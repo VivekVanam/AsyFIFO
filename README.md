@@ -1,112 +1,106 @@
-# Asynchronous FIFO: Dual-Clock, Gray-Pointer Design in Verilog-2001
+# Asynchronous FIFO: Dual-Clock, Gray-Pointer Design in Verilog
 
-A parameterized asynchronous FIFO that moves data between two unrelated clock domains (`wclk` and `rclk`) without loss, duplication or corruption. Only Gray-coded pointers cross the clock boundary, each through a two-flip-flop synchronizer, and the `full` / `empty` flags are generated directly in the Gray domain from look-ahead pointers. The repository includes a self-checking, scoreboard-based testbench that exercises overflow, underflow, wrap-around and random traffic at unrelated clock ratios.
+A parameterized asynchronous FIFO that moves data between two unrelated clock domains (`wclk` and `rclk`). Only Gray-coded pointers cross the clock boundary, each through a two-flip-flop synchronizer, and the `full` / `empty` flags are generated directly in the Gray domain from look-ahead (`_next`) pointers. The repository also contains a testbench that drives the FIFO from two clocks of different frequency and checks the read data against a manual, array-based scoreboard.
 
 | Property | Value |
 |---|---|
-| Language | Verilog-2001 (`$clog2` from IEEE 1364-2005); no SystemVerilog constructs |
-| Storage | `DEPTH` x `DATA_WIDTH`, all `DEPTH` entries usable (no sacrificed slot) |
-| Pointer width | `PTR_WIDTH + 1` bits, where `PTR_WIDTH = $clog2(DEPTH)`; the extra MSB is the wrap bit |
-| Reset | Independent, asynchronous-assert, active-low per domain (`wrst_n`, `rrst_n`) |
-| Read latency | `data_out` is valid one `rclk` after an accepted read (registered RAM output) |
-| Constraint | `DEPTH` must be a power of two and `>= 4` |
-| Verified with | Icarus Verilog 12 (`-g2005 -Wall`), 2567 words compared, 0 errors |
+| Language | Verilog (`$clog2` is used for the pointer width) |
+| Default configuration | `DEPTH = 8`, `DATA_WIDTH = 8`, `PTR_WIDTH = $clog2(DEPTH) = 3` |
+| Pointer width | `PTR_WIDTH + 1` bits (`[PTR_WIDTH:0]`); the extra MSB is the wrap bit |
+| Capacity | All `DEPTH` entries are usable; the wrap bit, not a sacrificed slot, separates full from empty |
+| Reset | Active-low, one per domain (`wrst_n`, `rrst_n`). Pointers and flags use asynchronous-assert resets; the synchronizer flops use a synchronous reset |
+| Read data | Combinational read: `data_out = fifo[b_rptr[PTR_WIDTH-1:0]]`. A registered-read variant is present in `fifo_mem.v` as a commented-out block |
+| Constraints | `DEPTH` is a power of two and `>= 4`. `fifo_mem` is instantiated without parameter overrides (see the `asynchronous_fifo.v` section) |
+| Testbench clocks | `wclk` period 10 ns (100 MHz), `rclk` period 34 ns (about 29.4 MHz) |
 
 ---
 
 ## 1. Architecture
 
-`N` below denotes `PTR_WIDTH`. Every signal on a boundary arrow between the two domains is a Gray-coded pointer; no binary pointer and no flag ever crosses.
+`N` denotes `PTR_WIDTH`. Every signal that crosses the dotted boundary is a Gray-coded pointer; no binary pointer and no flag ever crosses. Each synchronizer is clocked by the *destination* domain, which is why `sync_rptr` (clocked by `wclk`) sits on the write side of the boundary and `sync_wptr` (clocked by `rclk`) sits on the read side.
 
 ```
-          WRITE DOMAIN (wclk, wrst_n)                                   READ DOMAIN (rclk, rrst_n)
-                                                              :
-         +---------------+  g_wptr (Gray)                     :    +--------------+g_wptr_sync  +---------------+
- w_en -->| wptr_handler  |------------------------------------:--->| synchronizer |------------>| rptr_handler  |<-- r_en
-         | b_wptr g_wptr |                                    :    | (rclk, 2 FF) |             | b_rptr g_rptr |
-         | full          |                                    :    +--------------+             | empty         |
-         |               | g_rptr_sync  +--------------+      :       g_rptr (Gray)             |               |
-         |               |<-------------| synchronizer |<-----:---------------------------------|               |
-         |               |              | (wclk, 2 FF) |      :                                 |               |
-         +---------------+              +--------------+      :                                 +---------------+
-              |                                               :                                         |
-              | b_wptr[N-1:0]                                 :                         b_rptr[N-1:0]   |
-              |                                                                                         |
-              v                                                                                         v
-         +------------------------------------------------------------------------------------------------------+
-         | fifo_mem  (2^N x DATA_WIDTH dual-clock RAM)                                                          |
-data_in->| write port: wclk, guard (w_en & ~full)                   read port: rclk, guard (r_en & ~empty)      |--> data_out
-         |                                                                                                      |
-         +------------------------------------------------------------------------------------------------------+
+  WRITE DOMAIN  (wclk, wrst_n)                                READ DOMAIN  (rclk, rrst_n)
+        w_en                                             :                                          r_en
+          |                                              :                                            |
+          |                                              :                                            |
+          v                                              :                                            v
+  +-------------------+                                  :                                  +-------------------+
+  | wptr_handler      |                                  :    +---------------+             | rptr_handler      |
+  | (wptr_h)          |             g_wptr               :    | synchronizer  | g_wptr_sync | (rptr_h)          |
+  |                   |-------------------------------------->| (sync_wptr)   |------------>|                   |
+  | b_wptr  (reg)     |                                  :    | clk = rclk    |             | b_rptr  (reg)     |
+  | g_wptr  (reg)     |                                  :    +---------------+             | g_rptr  (reg)     |
+  | full    (reg)     |             +---------------+    :                                  | empty   (reg)     |
+  |                   |             | synchronizer  |    :                                  |                   |
+  | b_wptr_next       | g_rptr_sync | (sync_rptr)   |    :          g_rptr                  | b_rptr_next       |
+  | g_wptr_next       |<------------| clk = wclk    |<--------------------------------------| g_rptr_next       |
+  | wfull             |             +---------------+    :                                  | rempty            |
+  |                   |                                  :                                  |                   |
+  +-------------------+                                  :                                  +-------------------+
+      |           |                                                                             |       |
+      |           |                                                                             |       |
+      | b_wptr    | full                                                                  empty |       | b_rptr
+      |           |                                                                             |       |
+      |           |                                                                             |       |
+      v           v                                                                             v       v
+  +-------------------------------------------------------------------------------------------------------------+
+  |                               fifo_mem  (fifom)     reg [DATA_WIDTH-1:0] fifo [0:DEPTH-1]                   |
+  |                                                                                                             |
+  | write port (wclk):  if (w_en & !full)  fifo[b_wptr[PTR_WIDTH-1:0]] <= data_in;                              |
+  | read  port        :  assign data_out = fifo[b_rptr[PTR_WIDTH-1:0]];   // combinational read                 |
+  |                                                                                                             |
+  +-------------------------------------------------------------------------------------------------------------+
+                        ^                                                       |
+                        |                                                       v
+                  data_in                                                  data_out
 ```
 
-Clock-domain ownership:
+### Clock-domain ownership
 
-| Signal | Written in | Consumed in | Crosses via |
+| Signal | Driven in | Used in | Crosses via |
 |---|---|---|---|
 | `b_wptr` | `wclk` | `wclk` (RAM write address) | never crosses |
-| `g_wptr` | `wclk` | `rclk` (empty logic) | `synchronizer` -> `g_wptr_sync` |
+| `g_wptr` | `wclk` | `rclk` (empty logic) | `sync_wptr` -> `g_wptr_sync` |
 | `b_rptr` | `rclk` | `rclk` (RAM read address) | never crosses |
-| `g_rptr` | `rclk` | `wclk` (full logic) | `synchronizer` -> `g_rptr_sync` |
-| `full` | `wclk` | `wclk` | never crosses |
-| `empty` | `rclk` | `rclk` | never crosses |
-
-### Repository layout
-
-```
-.
-├── README.md
-├── asynchronous_fifo.v     top level, structural only
-├── synchronizer.v          2-FF multi-bit synchronizer (single-bit-change buses only)
-├── wptr_handler.v          write pointer, Gray encode, full flag
-├── rptr_handler.v          read pointer, Gray encode, empty flag
-├── fifo_mem.v              dual-clock memory array
-└── async_fifo_TB.v         self-checking testbench with scoreboard
-```
+| `g_rptr` | `rclk` | `wclk` (full logic) | `sync_rptr` -> `g_rptr_sync` |
+| `full` | `wclk` | `wclk` (pointer gating, RAM write guard) | never crosses |
+| `empty` | `rclk` | `rclk` (pointer gating) | never crosses |
 
 ### Top-level interface
 
 | Port | Dir | Width | Domain | Description |
 |---|---|---|---|---|
-| `wclk`, `wrst_n` | in | 1 | write | Write clock, active-low async reset |
-| `rclk`, `rrst_n` | in | 1 | read | Read clock, active-low async reset |
-| `w_en` | in | 1 | write | Write request; accepted only if `full` is low |
-| `r_en` | in | 1 | read | Read request; accepted only if `empty` is low |
+| `wclk`, `wrst_n` | in | 1 | write | Write clock, active-low reset |
+| `rclk`, `rrst_n` | in | 1 | read | Read clock, active-low reset |
+| `w_en` | in | 1 | write | Write request; accepted only while `full` is low |
+| `r_en` | in | 1 | read | Read request; the read pointer advances only while `empty` is low |
 | `data_in` | in | `DATA_WIDTH` | write | Write data |
-| `data_out` | out | `DATA_WIDTH` | read | Read data, valid one `rclk` after an accepted `r_en` |
-| `full` | out | 1 | write | Registered flag; no further writes are accepted |
-| `empty` | out | 1 | read | Registered flag; no further reads are accepted |
+| `data_out` | out (`wire`) | `DATA_WIDTH` | read | `fifo[b_rptr]`, a combinational read of the word at the current read pointer |
+| `full` | out (`wire`) | 1 | write | Registered flag inside `wptr_handler` |
+| `empty` | out (`wire`) | 1 | read | Registered flag inside `rptr_handler` |
 
-### Flag and data latency
+### Flag timing
 
 | Event | Observable effect | Latency |
 |---|---|---|
-| Accepted write | `empty` deasserts | 2 `rclk` synchronizer edges + 1 flag-register edge (about 3 `rclk`, plus up to one `rclk` of phase uncertainty) |
-| Accepted read | `full` deasserts | 2 `wclk` synchronizer edges + 1 flag-register edge (about 3 `wclk`, plus up to one `wclk` of phase uncertainty) |
-| Accepted read | `data_out` updates | 1 `rclk` |
-| Write that fills the last slot | `full` asserts | same `wclk` edge as the pointer update (look-ahead, see `wptr_handler.v`) |
-| Read that drains the last word | `empty` asserts | same `rclk` edge as the pointer update (look-ahead, see `rptr_handler.v`) |
+| Accepted write | `empty` deasserts | 2 `rclk` edges through `sync_wptr` + 1 `rclk` edge into the `empty` register: about 3 `rclk`, plus up to one `rclk` of phase uncertainty |
+| Accepted read | `full` deasserts | 2 `wclk` edges through `sync_rptr` + 1 `wclk` edge into the `full` register: about 3 `wclk`, plus up to one `wclk` of phase uncertainty |
+| Write that fills the last slot | `full` asserts | On the same `wclk` edge that updates `b_wptr` (look-ahead, see `wptr_handler.v`) |
+| Read that drains the last word | `empty` asserts | On the same `rclk` edge that updates `b_rptr` (look-ahead, see `rptr_handler.v`) |
 
-The deassertion delays are intentional and safe: each side sees a slightly stale copy of the other side's pointer, which can only make the FIFO look fuller (to the writer) or emptier (to the reader) than it really is. Assertion is exact, deassertion is conservative.
+Deassertion is delayed and assertion is immediate. Each side sees a slightly stale copy of the other side's pointer, which can only make the FIFO look fuller (to the writer) or emptier (to the reader) than it really is. The error is always in the safe direction.
 
 ### Build and run
 
+All six source files are required; none of the `` `include `` lines in `asynchronous_fifo.v` is active. Icarus Verilog is shown as an example; in Vivado, add the six files as sources and set `async_fifo_TB` as the simulation top. The testbench writes `dump.vcd`.
+
 ```bash
-iverilog -g2005 -Wall -o async_fifo_sim \
+iverilog -g2012 -Wall -o async_fifo_sim \
     fifo_mem.v synchronizer.v wptr_handler.v rptr_handler.v \
     asynchronous_fifo.v async_fifo_TB.v
 vvp async_fifo_sim
-gtkwave async_fifo.vcd
-```
-
-Expected console summary:
-
-```
- words written : 2567
- words read    : 2567
- words compared: 2567
- errors        : 0
- RESULT: PASS
+gtkwave dump.vcd
 ```
 
 ---
@@ -115,187 +109,195 @@ Expected console summary:
 
 ### `asynchronous_fifo.v`
 
-**Purpose.** Pure structural top level. It contains no behavioural logic: it computes `PTR_WIDTH`, declares the interconnect, and instantiates five blocks: two `synchronizer` instances (one per crossing direction), `wptr_handler`, `rptr_handler` and `fifo_mem`.
+**Purpose.** Structural top level. It contains no behavioural logic. It derives `PTR_WIDTH`, declares the interconnect buses, and instantiates five blocks: two `synchronizer` instances (one per crossing direction), `wptr_handler`, `rptr_handler` and `fifo_mem`.
 
 ```verilog
-module asynchronous_fifo #(
-    parameter DEPTH      = 8,                 // power of 2, >= 4
-    parameter DATA_WIDTH = 8
-) (
-    input                   wclk,
-    input                   wrst_n,
-    input                   rclk,
-    input                   rrst_n,
-    input                   w_en,
-    input                   r_en,
-    input  [DATA_WIDTH-1:0] data_in,
-    output [DATA_WIDTH-1:0] data_out,         // wire: driven by fifo_mem port
-    output                  full,             // wire: driven by wptr_handler port
-    output                  empty             // wire: driven by rptr_handler port
+//`include "synchronizer.v"
+//`include "wptr_handler.v"
+//`include "rptr_handler.v"
+//`include "fifo_mem.v"
+
+module asynchronous_fifo #(parameter DEPTH=8, DATA_WIDTH=8) (
+  input wclk, wrst_n,
+  input rclk, rrst_n,
+  input w_en, r_en,
+  input [DATA_WIDTH-1:0] data_in,
+  output wire [DATA_WIDTH-1:0] data_out,
+  output wire full, empty
 );
-    localparam PTR_WIDTH = $clog2(DEPTH);
+  
+  parameter PTR_WIDTH = $clog2(DEPTH);
+ 
+  wire [PTR_WIDTH:0] g_wptr_sync, g_rptr_sync;
+  wire [PTR_WIDTH:0] b_wptr, b_rptr;
+  wire [PTR_WIDTH:0] g_wptr, g_rptr;
 
-    wire [PTR_WIDTH:0] b_wptr, b_rptr;
-    wire [PTR_WIDTH:0] g_wptr, g_rptr;
-    wire [PTR_WIDTH:0] g_wptr_sync, g_rptr_sync;
+//  wire [PTR_WIDTH-1:0] waddr, raddr;
 
-    synchronizer #(.WIDTH(PTR_WIDTH)) sync_wptr (
-        .clk(rclk), .rst_n(rrst_n), .d_in(g_wptr), .d_out(g_wptr_sync));
+  synchronizer #(PTR_WIDTH) sync_wptr (rclk, rrst_n, g_wptr, g_wptr_sync); //write pointer to read clock domain
+  synchronizer #(PTR_WIDTH) sync_rptr (wclk, wrst_n, g_rptr, g_rptr_sync); //read pointer to write clock domain 
+  
+  wptr_handler #(PTR_WIDTH) wptr_h(wclk, wrst_n, w_en,g_rptr_sync,b_wptr,g_wptr,full);
+  rptr_handler #(PTR_WIDTH) rptr_h(rclk, rrst_n, r_en,g_wptr_sync,b_rptr,g_rptr,empty);
+  fifo_mem fifom(wclk, w_en, rclk, r_en,b_wptr, b_rptr, data_in,full,empty, data_out);
 
-    synchronizer #(.WIDTH(PTR_WIDTH)) sync_rptr (
-        .clk(wclk), .rst_n(wrst_n), .d_in(g_rptr), .d_out(g_rptr_sync));
-
-    wptr_handler #(.PTR_WIDTH(PTR_WIDTH)) wptr_h (
-        .wclk(wclk), .wrst_n(wrst_n), .w_en(w_en),
-        .g_rptr_sync(g_rptr_sync),
-        .b_wptr(b_wptr), .g_wptr(g_wptr), .full(full));
-
-    rptr_handler #(.PTR_WIDTH(PTR_WIDTH)) rptr_h (
-        .rclk(rclk), .rrst_n(rrst_n), .r_en(r_en),
-        .g_wptr_sync(g_wptr_sync),
-        .b_rptr(b_rptr), .g_rptr(g_rptr), .empty(empty));
-
-    fifo_mem #(.DEPTH(DEPTH), .DATA_WIDTH(DATA_WIDTH), .PTR_WIDTH(PTR_WIDTH)) fifom (
-        .wclk(wclk), .w_en(w_en), .rclk(rclk), .r_en(r_en),
-        .b_wptr(b_wptr), .b_rptr(b_rptr),
-        .data_in(data_in), .full(full), .empty(empty),
-        .data_out(data_out));
 endmodule
 ```
 
+**Instance map.** All connections are positional, so the order of the actual arguments must match the port order of each submodule exactly.
+
+| Instance | Module | Parameters | Positional connections (actual -> formal port) |
+|---|---|---|---|
+| `sync_wptr` | `synchronizer` | `#(PTR_WIDTH)` | `rclk` -> `clk`, `rrst_n` -> `rst_n`, `g_wptr` -> `d_in`, `g_wptr_sync` -> `d_out` |
+| `sync_rptr` | `synchronizer` | `#(PTR_WIDTH)` | `wclk` -> `clk`, `wrst_n` -> `rst_n`, `g_rptr` -> `d_in`, `g_rptr_sync` -> `d_out` |
+| `wptr_h` | `wptr_handler` | `#(PTR_WIDTH)` | `wclk`, `wrst_n`, `w_en`, `g_rptr_sync`, `b_wptr`, `g_wptr`, `full` |
+| `rptr_h` | `rptr_handler` | `#(PTR_WIDTH)` | `rclk`, `rrst_n`, `r_en`, `g_wptr_sync`, `b_rptr`, `g_rptr`, `empty` |
+| `fifom` | `fifo_mem` | none (defaults) | `wclk`, `w_en`, `rclk`, `r_en`, `b_wptr`, `b_rptr`, `data_in`, `full`, `empty`, `data_out` |
+
 **Structural logic.**
 
-- `localparam PTR_WIDTH = $clog2(DEPTH)` is the number of memory address bits. Every pointer bus is declared `[PTR_WIDTH:0]`, one bit wider than the address, so the pointer sequence has `2 x DEPTH` states and the wrap bit disambiguates full from empty.
-- `sync_wptr` is clocked by `rclk`/`rrst_n`: it carries `g_wptr` from the write domain into the read domain. `sync_rptr` is clocked by `wclk`/`wrst_n` and carries `g_rptr` the other way. The synchronizer is always clocked by the *destination* domain.
-- `wptr_handler` receives `g_rptr_sync` (the only read-domain information the write side ever sees) and produces `b_wptr`, `g_wptr` and `full`. `rptr_handler` is its mirror image and produces `b_rptr`, `g_rptr` and `empty`.
-- `fifo_mem` receives only the binary pointers, which stay inside their own domains, plus the flags used as write/read guards.
+- `parameter PTR_WIDTH = $clog2(DEPTH)` is the number of memory address bits. Every pointer bus is declared `[PTR_WIDTH:0]`, one bit wider than the address, so the pointer sequence has `2 x DEPTH` states and the wrap bit disambiguates full from empty.
+- `sync_wptr` is clocked by `rclk` / `rrst_n` and carries `g_wptr` into the read domain. `sync_rptr` is clocked by `wclk` / `wrst_n` and carries `g_rptr` into the write domain. The `#(PTR_WIDTH)` override sets the synchronizer's `WIDTH`, so its bus is `[PTR_WIDTH:0]`, matching the pointers.
+- `wptr_h` receives `g_rptr_sync`, the only read-domain information the write side ever sees, and produces `b_wptr`, `g_wptr` and `full`. `rptr_h` is its mirror image and produces `b_rptr`, `g_rptr` and `empty`.
+- `fifom` receives the *binary* pointers, which never leave their own domains, plus the flags, which it uses as guards.
 
-**Why `full`, `empty` and `data_out` are `wire` in this file.** In Verilog-2001 an output port of an instantiated module is a *continuous driver* of whatever it is connected to. A `reg` is a *variable*, which may only receive procedural assignments from `always` / `initial` blocks, so connecting a submodule output to a `reg` creates a concurrent (continuous) assignment to a non-net. Tools reject it. Icarus reports `reg full; cannot be driven by primitives or continuous assignment` together with `Output port expression must support continuous assignment`; other tools word it differently (typically as a "concurrent assignment to a non-net" or illegal output-port connection) but all reject it. This was reproduced in this repository by changing the two declarations to `output reg full, empty`:
+**Why `full`, `empty` and `data_out` are `wire`, not `reg`, at this level.** In Verilog, an output port of an instantiated module drives whatever it is connected to through a *continuous* connection. A `reg` is a variable and may only be assigned procedurally from an `always` or `initial` block. If the top level declared `output reg full, empty`, then `wptr_h`'s `full` port and `rptr_h`'s `empty` port would be continuously driving a variable. Vivado rejects that with the error `concurrent assignment to a non-net is not permitted`, because only nets (`wire`) can be the target of a continuous driver. The declaration `output wire full, empty` in this file is therefore not stylistic; it is what makes the port connections legal.
 
-```
-asynchronous_fifo.v:31: error: reg full; cannot be driven by primitives or continuous assignment.
-asynchronous_fifo.v:31: error: Output port expression must support continuous assignment.
-asynchronous_fifo.v:31:      : Port 7 (full) of wptr_handler is connected to full
-```
+The storage element behind `full` is still a flip-flop. It lives inside `wptr_handler`, where `full` is declared `output reg` and assigned in an `always @(posedge wclk or negedge wrst_n)` block. That is legal because the assignment is procedural and local to the module that owns the register. Seen from the parent, `full` is just the net on which that flop's output appears. The same rule holds for `empty` (a register inside `rptr_handler`) and for `data_out` (driven by the continuous `assign` in `fifo_mem`, which is why it is `output wire` there). It also explains why all the interconnect buses (`g_wptr_sync`, `b_wptr`, `g_wptr`, and so on) are declared `wire`, and why the testbench declares `full`, `empty` and `data_out` as `wire`: in every case a submodule is the driver.
 
-The actual storage element for `full` is a flip-flop, and it does exist, but it lives *inside* `wptr_handler` (`output reg full`, assigned in an `always @(posedge wclk ...)` block, which is legal because the assignment is procedural and local). In the parent, `full` is simply the net on which that flop's output is observed, so the parent must declare it as a net. The same rule applies to `empty`, to `data_out` (driven by the output register inside `fifo_mem`), and to every interconnect bus (`b_wptr`, `g_wptr`, `g_rptr_sync`, ...), which is why all of them are `wire`. The testbench follows the same rule: `full`, `empty` and `data_out` are `wire` in `async_fifo_TB.v`, because the DUT drives them. (In SystemVerilog, `logic` removes this restriction for single-driver signals, but this code base is deliberately pure Verilog-2001.)
+**Parameter constraints.**
 
-**Parameter constraint.** `DEPTH` must be a power of two for two reasons: the pointer must wrap to zero naturally, and the Gray sequence is cyclic (its last code differs from code 0 by one bit) only when the count of states, `2 x DEPTH`, is a power of two. `DEPTH >= 4` is required because the full comparison slices `g_rptr_sync[PTR_WIDTH-2:0]`, which needs `PTR_WIDTH >= 2`.
+- `DEPTH` must be a power of two. The pointer must wrap naturally, and the Gray sequence is cyclic (its last code differs from the first by one bit) only when the number of states, `2 x DEPTH`, is a power of two.
+- `DEPTH >= 4`, because the full comparison in `wptr_handler` slices `g_rptr_sync[PTR_WIDTH-2:0]`, which requires `PTR_WIDTH >= 2`.
+- `fifom` is instantiated as `fifo_mem fifom(...)` with no `#(...)` override, so `fifo_mem` always runs with its own defaults (`DEPTH=8`, `DATA_WIDTH=8`, `PTR_WIDTH=3`). The synchronizers and handlers follow `PTR_WIDTH` (derived from the top-level `DEPTH`) and the top-level `data_in` / `data_out` follow `DATA_WIDTH`, but the memory does not. For any configuration other than the 8 x 8 default, the instantiation needs `#(DEPTH, DATA_WIDTH, PTR_WIDTH)` (positional order of the `fifo_mem` parameters) or the equivalent named override; otherwise the pointer ports and the array dimensions disagree with the rest of the design.
+- The commented-out `` `include `` lines and the commented `waddr, raddr` declaration have no effect; the file list in the build step is what pulls in the other modules.
 
 ---
 
 ### `synchronizer.v`
 
-**Purpose.** The only place where a signal is allowed to change clock domain. It is a two-stage flip-flop synchronizer sampled by the destination clock, instantiated twice, once per pointer.
+**Purpose.** The only place in the design where a signal changes clock domain. It is a two-stage flip-flop synchronizer clocked by the destination clock, instantiated twice (`sync_wptr`, `sync_rptr`), each time carrying one Gray-coded pointer.
 
 ```verilog
-module synchronizer #(
-    parameter WIDTH = 3                       // address bits; bus is WIDTH+1 wide
-) (
-    input                  clk,               // DESTINATION-domain clock
-    input                  rst_n,             // destination-domain reset (active low)
-    input      [WIDTH:0]   d_in,              // Gray-coded pointer from the other domain
-    output     [WIDTH:0]   d_out              // pointer, safe to use in clk domain
-);
-    (* ASYNC_REG = "TRUE" *) reg [WIDTH:0] q1;   // stage 1: may go metastable
-    (* ASYNC_REG = "TRUE" *) reg [WIDTH:0] q2;   // stage 2: resolved value
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 11.10.2026 19:52:28
+// Design Name: 
+// Module Name: synchronizer
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            q1 <= {(WIDTH+1){1'b0}};
-            q2 <= {(WIDTH+1){1'b0}};
-        end else begin
-            q1 <= d_in;
-            q2 <= q1;
-        end
+
+module synchronizer #(parameter WIDTH=3) (input clk, rst_n, [WIDTH:0] d_in, output reg [WIDTH:0] d_out);
+  reg [WIDTH:0] q1;
+  always@(posedge clk) begin
+    if(!rst_n) begin
+      q1 <= 0;
+      d_out <= 0;
     end
-
-    assign d_out = q2;
+    else begin
+      q1 <= d_in;
+      d_out <= q1;
+    end
+  end
 endmodule
 ```
 
-**Why raw (binary) pointers must never cross a clock boundary.** Two independent failure mechanisms apply, and they compound.
+**Structure.** `q1` is the first stage and `d_out` (declared `output reg`) is the second stage. Both are clocked by `clk`, the destination clock, and both are cleared by `rst_n`. `d_in` inherits the `input` direction from the port list, and its width is `WIDTH+1`, matching the pointer bus. Because `d_out` is itself the second flop, the module can legally declare it `output reg`: the assignment is procedural and inside the module that owns it, and the parent connects it to a `wire`. The reset in this module is synchronous (the sensitivity list contains only `posedge clk`), unlike the handlers, whose pointer and flag registers reset asynchronously.
 
-*1. Metastability caused by setup/hold violation.* A flip-flop guarantees a clean 0/1 output only if its data input is stable for `t_su` before and `t_h` after the active clock edge. The source pointer changes on `wclk`, which has no phase relationship to `rclk`, so sooner or later a pointer bit changes inside the capture window of the `rclk` flop. The master latch of the flop, a pair of cross-coupled inverters, is then left balanced near its unstable equilibrium. Its internal node sits at an intermediate voltage between `V_IL` and `V_IH`, and the output resolves to 0 or 1 only after a random time governed by an exponential regeneration, with resolution time constant `tau`. Three things go wrong while it hovers:
+**Why a raw, unsynchronized signal must never cross a clock boundary.** Two independent failure mechanisms apply, and they compound.
 
-- The intermediate voltage propagates into downstream gates. Gates with different input thresholds interpret it differently, so one fan-out branch sees `1` while another sees `0`, and the design is in two states at once.
+*1. Metastability from setup/hold violation.* A flip-flop produces a clean 0 or 1 only if its data input is stable for the setup time `t_su` before and the hold time `t_h` after the active clock edge. The source pointer changes on `wclk` (or `rclk`), which has no phase relationship to the capturing clock, so sooner or later a pointer bit changes inside the capture window of the destination flop. The flop's internal latch, a pair of cross-coupled inverters, is then left near its unstable equilibrium, with an internal node at an intermediate voltage between `V_IL` and `V_IH`. It eventually resolves to 0 or 1, but after a random time that follows an exponential regeneration law with time constant `tau`. While it hovers:
+
+- The intermediate level propagates into downstream gates. Gates with different input thresholds interpret it differently, so one fan-out branch can see `1` while another sees `0`, and the design is briefly in two states at once.
 - Even if the level resolves, it may do so late enough to violate setup time on the *next* register, extending the problem downstream.
-- The result of the sample (old value or new value) is unpredictable even after resolution.
+- Which value the flop settles to, old or new, is unpredictable.
 
-The failure probability is quantified by `MTBF = e^(t_r / tau) / (T_0 x f_clk x f_data)`, where `t_r` is the time available for resolution. It cannot be driven to zero, only made exponentially rare by increasing `t_r`.
+The reliability of a synchronizer is quantified as `MTBF = e^(t_r / tau) / (T_0 x f_clk x f_data)`, where `t_r` is the time allowed for resolution. Metastability cannot be eliminated, only made exponentially rare by increasing `t_r`.
 
-*2. Multi-bit convergence glitches.* Even without metastability, a multi-bit bus is not sampled atomically. Each bit has a different route delay, so on any given destination edge each bit independently reads either its old or its new value. A binary counter makes this catastrophic, because increments can flip many bits at once. Take a 4-bit pointer going from `0111` (7) to `1000` (8): all four bits flip. The capture flops can legally observe any of the 16 combinations, for example `1111` (15), `0000` (0), `1011` (11) or `0100` (4). None of those is "7" or "8". The read side might then compute `empty = (rptr == sampled_wptr)` against a pointer that is 7 words ahead of reality and pop entries that were never written (underrun), while the write side, given a corrupted `rptr`, might believe space exists and overwrite unread data (overrun). The binary number is effectively warped, and because the error is transient and pattern dependent, simulation with zero-delay gates will never reveal it.
+*2. Multi-bit convergence glitches.* Even ignoring metastability, a multi-bit bus is not sampled atomically. Each bit has its own routing delay, so on a given destination edge each bit independently captures either its old or its new value. A binary counter makes this catastrophic, because one increment can flip many bits. A 4-bit pointer going from `0111` (7) to `1000` (8) flips all four bits, so the capture flops can legally observe any of the 16 combinations, for example `1111`, `0000`, `1011` or `0100`. None of those is 7 or 8. The read side could then compare against a write pointer that is nowhere near the real one, so `empty` deasserts while the RAM holds nothing new (underflow), or the write side sees a corrupted read pointer and overwrites unread data (overflow). The error is transient and pattern dependent, which is why zero-delay RTL simulation never exposes it.
 
-**Why the two-flop structure fixes metastability.** Stage `q1` is allowed to go metastable; that is its job. Its output is not used by any logic. It feeds only the data input of stage `q2`, so `q1` has one full destination clock period (minus clk-to-Q and `t_su` of `q2`) to settle, which gives `t_r` close to `T_clk`. Because the resolution probability improves exponentially with `t_r`, a whole period of settling time lowers the probability that `q2` ever samples an unresolved level by many orders of magnitude, and `q2` becomes the first signal that is safe to use in the destination domain. A synchronizer does not make the *value* deterministic (`q2` may legitimately show the old or the new pointer), it only guarantees that the value is a clean logic level. That is exactly why the data entering it must be a code in which "old or new" are both valid, which is the role of the Gray encoding in `wptr_handler.v` and `rptr_handler.v` (one bit changes per increment, so a skewed sample is always either the previous pointer or the next one, never a third value). Synchronizer and Gray coding are two halves of one solution.
+**How Gray coding removes the multi-bit problem.** `g_wptr` and `g_rptr` are Gray codes, in which consecutive values differ in exactly one bit (7 -> 8 is `0100` -> `1100`). A pointer moves by at most one count per source clock, so only one bit of the bus is ever in flight. If the capture flop catches that bit "early" or "late", the sampled bus is either the old pointer or the new pointer, never a third value. If the destination clock is slower and several increments happen between two samples, each sample is still a pointer value that really existed at some instant; it is merely stale, which the flag logic tolerates. Gray coding and the synchronizer are two halves of one solution: the synchronizer guarantees that each captured bit is a clean logic level, and the Gray code guarantees that "old or new" are both legal answers. This is also why the handlers send the *registered* `g_wptr` / `g_rptr` into the synchronizers and never the combinational `_next` values: a glitching combinational signal on a path that must carry exactly one transition would defeat the encoding.
+
+**How the two-flop structure isolates the domains.** `q1` is allowed to go metastable; that is its job. Its output is not used by any logic and feeds only the D input of the second stage, so `q1` has essentially one full destination clock period (minus clock-to-Q and the setup time of `d_out`) to decay to a stable level before the second flop samples it. That makes `t_r` approximately `T_clk`, and because the failure probability falls exponentially with `t_r`, a full period of settling lowers the chance that the second stage ever samples an unresolved level by many orders of magnitude. `d_out` is therefore the first signal that is safe to use in the destination domain, and all destination-domain logic (`rempty`, `wfull`) reads only that second-stage output. The synchronizer does not make the *value* deterministic; it makes it a clean, possibly one-cycle-stale, logic level.
 
 **Implementation notes.**
 
-- Both stages use the destination clock and destination reset; the reset is asynchronous-assert so the pointers are cleared even before the destination clock is running.
-- `(* ASYNC_REG = "TRUE" *)` instructs Xilinx tools to place `q1` and `q2` in the same slice and to exclude them from retiming or SRL inference, which preserves the settling time. Other tool flows ignore the attribute.
-- Recommended constraints: a `set_max_delay -datapath_only` on `g_wptr -> q1` and `g_rptr -> q1` bounded by one source or destination period, and `set_bus_skew` on the Gray buses so that the single-bit-change property is not destroyed by routing skew.
-- Pointer synchronization latency is the reason flag deassertion is delayed by a few cycles; see the latency table above.
+- Latency: two destination clock edges through the module, plus one more edge into the flag register, which is why flag deassertion is delayed by about three destination clocks (see the flag timing table).
+- This source has no `(* ASYNC_REG = "TRUE" *)` attribute on `q1` / `d_out`. In a Vivado flow, adding it to both registers tells the tools to place them in the same slice and to keep them out of retiming or shift-register inference, which preserves the settling time. Timing constraints for these paths (a datapath-only max-delay from `g_wptr` / `g_rptr` into `q1`, and a bus-skew limit on the Gray buses so the one-bit-change property survives routing) are also normally applied in the XDC.
 
 ---
 
 ### `wptr_handler.v`
 
-**Purpose.** Everything the write domain owns: the binary write pointer used to address memory, its Gray-coded twin sent to the read domain, and the registered `full` flag.
+**Purpose.** Everything the write domain owns: the binary write pointer that addresses memory, its Gray-coded twin that is sent to the read domain, and the registered `full` flag.
 
 ```verilog
-module wptr_handler #(
-    parameter PTR_WIDTH = 3
-) (
-    input                    wclk,
-    input                    wrst_n,
-    input                    w_en,
-    input  [PTR_WIDTH:0]     g_rptr_sync,     // read pointer, Gray, synchronized into wclk
-    output reg [PTR_WIDTH:0] b_wptr,          // binary write pointer (memory address + wrap bit)
-    output reg [PTR_WIDTH:0] g_wptr,          // Gray write pointer (sent across domains)
-    output reg               full
+module wptr_handler #(parameter PTR_WIDTH=3) (
+  input wclk, wrst_n, w_en,
+  input [PTR_WIDTH:0] g_rptr_sync,
+  output reg [PTR_WIDTH:0] b_wptr, g_wptr,
+  output reg full
 );
-    wire [PTR_WIDTH:0] b_wptr_next;
-    wire [PTR_WIDTH:0] g_wptr_next;
-    wire               wfull;
 
-    // look-ahead pointer: advances only for an ACCEPTED write
-    assign b_wptr_next = b_wptr + (w_en & ~full);
-    // binary -> Gray: one XOR per bit
-    assign g_wptr_next = (b_wptr_next >> 1) ^ b_wptr_next;
-
-    // FULL: next Gray write pointer == read pointer with its two MSBs inverted
-    assign wfull = (g_wptr_next == {~g_rptr_sync[PTR_WIDTH:PTR_WIDTH-1],
-                                     g_rptr_sync[PTR_WIDTH-2:0]});
-
-    always @(posedge wclk or negedge wrst_n) begin
-        if (!wrst_n) begin
-            b_wptr <= {(PTR_WIDTH+1){1'b0}};
-            g_wptr <= {(PTR_WIDTH+1){1'b0}};
-        end else begin
-            b_wptr <= b_wptr_next;
-            g_wptr <= g_wptr_next;
-        end
+  wire [PTR_WIDTH:0] b_wptr_next;
+  wire [PTR_WIDTH:0] g_wptr_next;
+   
+  reg wrap_around;
+  wire wfull;
+  
+  assign b_wptr_next = b_wptr+(w_en & !full);
+  assign g_wptr_next = (b_wptr_next >>1)^b_wptr_next;
+  
+  always@(posedge wclk or negedge wrst_n) begin
+    if(!wrst_n) begin
+      b_wptr <= 0; // set default value
+      g_wptr <= 0;
     end
-
-    always @(posedge wclk or negedge wrst_n) begin
-        if (!wrst_n) full <= 1'b0;
-        else         full <= wfull;
+    else begin
+      b_wptr <= b_wptr_next; // incr binary write pointer
+      g_wptr <= g_wptr_next; // incr gray write pointer
     end
+  end
+  
+  always@(posedge wclk or negedge wrst_n) begin
+    if(!wrst_n) full <= 0;
+    else        full <= wfull;
+  end
+
+  assign wfull = (g_wptr_next == {~g_rptr_sync[PTR_WIDTH:PTR_WIDTH-1], g_rptr_sync[PTR_WIDTH-2:0]});
+
 endmodule
 ```
 
 **Pointer datapath.**
 
-- `b_wptr_next = b_wptr + (w_en & ~full)` increments only when a write is *accepted*. Gating by `~full` here means the pointer cannot run past a full FIFO even if the producer keeps `w_en` high.
-- `g_wptr_next = (b_wptr_next >> 1) ^ b_wptr_next` is the binary-to-Gray conversion, one XOR per bit, no carry chain.
-- `g_wptr` and `g_wptr_next` hold the same quantity at two moments. `g_wptr_next` is the combinational value at the D input of the register; `g_wptr` is the registered value at its Q output. After the clock edge, the register has loaded `g_wptr_next`, so the two names refer to the same pointer one cycle apart. Only the registered `g_wptr` is sent to the synchronizer, because a combinational signal leaving the domain would add glitches to a path that must be glitch-free.
+- `b_wptr_next = b_wptr + (w_en & !full)` increments only on an accepted write. Gating with `!full` means the pointer cannot run past a full FIFO even if the producer holds `w_en` high.
+- `g_wptr_next = (b_wptr_next >> 1) ^ b_wptr_next` is the binary-to-Gray conversion: one XOR per bit, no carry chain.
+- `b_wptr` and `g_wptr` are registered together in the first `always` block, so the Gray pointer is always the Gray encoding of the binary pointer. `g_wptr_next` is the combinational value at the D input of the `g_wptr` register; after the clock edge the register holds that value, so `g_wptr_next` and `g_wptr` are the same quantity one cycle apart.
+- `reg wrap_around;` is declared but never used. It has no effect on the design and can be removed.
+- Reset clears both pointers and `full` to 0 (asynchronous assert on `wrst_n`).
 
-**Full-flag generation: direct Gray comparison (Way 2).**
+**Full-flag generation without Gray-to-binary conversion.**
 
-For a pointer with an extra MSB, the FIFO is full when the write pointer has advanced exactly `DEPTH` positions beyond the read pointer. In binary this means the pointers are identical except for the MSB: `b_wptr == b_rptr ^ (1 << N)`.
+The FIFO is full when the write pointer has advanced exactly `DEPTH` positions beyond the read pointer. With the extra wrap bit, that means the two binary pointers are identical in every bit except the MSB: `b_wptr == b_rptr ^ (1 << N)`.
 
-*Way 1* converts the synchronized Gray read pointer back to binary (`bin[i] = ^gray[N:i]`, a cascade of up to `N` XORs per bit), compares it to the binary look-ahead write pointer with "MSB differs, other bits equal", and registers the result. This puts a gray-to-binary prefix-XOR network, plus a mixed comparator, on the critical path from `g_rptr_sync` to the `full` register. The network costs either `N` XORs in a serial chain (logic depth `N`) or up to `N(N+1)/2` XORs if it is flattened to cut the depth, so area and delay trade against each other and both grow with pointer width.
+The direct way to test this from a synchronized *Gray* read pointer is to convert it back to binary first (`bin[i] = ^gray[N:i]`), then compare "MSB differs, all other bits equal". That prefix-XOR network is a serial chain of up to `N` XORs (logic depth `N`), or up to `N(N+1)/2` XORs if flattened to cut the depth, so it costs area or delay and both grow with the pointer width, all on the path into the `full` register.
 
-*Way 2*, used here, never leaves the Gray domain. The Gray encoding `g(b) = b ^ (b >> 1)` is linear over GF(2), which means `g(x ^ y) = g(x) ^ g(y)`. Applying it to the binary full condition with `M = 1 << N` (the MSB mask):
+This design never leaves the Gray domain. Gray encoding `g(b) = b ^ (b >> 1)` is linear over GF(2), so `g(x ^ y) = g(x) ^ g(y)`. Apply it to the binary full condition with the MSB mask `M = 1 << N`:
 
 ```
 g(b_wptr) = g(b_rptr ^ M)
@@ -306,11 +308,11 @@ g(b_wptr) = g(b_rptr ^ M)
 
 So **full means the Gray write pointer equals the Gray read pointer with its top two bits inverted and every other bit unchanged.** That is exactly the expression in the RTL:
 
-```verilog
+```
 {~g_rptr_sync[PTR_WIDTH:PTR_WIDTH-1], g_rptr_sync[PTR_WIDTH-2:0]}
 ```
 
-Why two bits and not one: in a Gray code the MSB of a number is the MSB of its binary value, but the second Gray bit is `b[N] ^ b[N-1]`. Flipping `b[N]` in binary therefore flips *both* Gray bit `N` and Gray bit `N-1`. Worked example for `DEPTH = 8` (4-bit pointers):
+Why two bits and not one: the Gray MSB equals the binary MSB, but the next Gray bit is `b[N] ^ b[N-1]`. Flipping `b[N]` in binary therefore flips *both* Gray bit `N` and Gray bit `N-1`, while bits `N-2:0` are unaffected. Worked example for `DEPTH = 8` (4-bit pointers):
 
 | `b_wptr` | `g_wptr` | `b_rptr` | `g_rptr` | `g_rptr` with top 2 bits inverted | Full? |
 |---|---|---|---|---|---|
@@ -318,345 +320,286 @@ Why two bits and not one: in a Gray code the MSB of a number is the MSB of its b
 | 11 (`1011`) | `1110` | 3 (`0011`) | `0010` | `1110` | yes |
 | 9 (`1001`) | `1101` | 0 (`0000`) | `0000` | `1100` | no |
 
-Hardware cost of Way 2: two inverters and an `(N+1)`-bit equality comparator (XNOR per bit, AND-reduce). There is no gray-to-binary network, so it is both smaller (roughly `N+1` XNORs, versus the comparator plus the prefix-XOR network of Way 1) and faster (the longest path is one inverter, one XNOR and a reduction AND, independent of the XOR chain whose depth grows with pointer width). Because a Gray code is a bijection, plain equality tests also work without conversion, which is why `empty` is a straight equality compare (see `rptr_handler.v`).
+The hardware cost is two inverters and an `(N+1)`-bit equality comparator (one XNOR per bit and an AND reduction). There is no Gray-to-binary network, so the logic is smaller and the longest path (inverter, XNOR, AND-reduce) does not grow with an XOR chain. The comparison uses `g_rptr_sync`, which is slightly stale, so `full` may stay asserted a few cycles after the reader has freed a slot but can never deassert early.
 
 **Why the flag is computed from `g_wptr_next`, not `g_wptr`.**
 
-`full` is a registered flag (`full <= wfull`), and a registered flag always lags the logic that feeds it by one clock. If `wfull` were computed from the *current* `g_wptr`, the flag would describe the FIFO as it was one write ago. Timeline for `DEPTH = 8` holding 7 words, no reads, `w_en` held high:
+`full` is a registered flag (`full <= wfull`), and a registered flag always trails the logic that feeds it by one clock. If `wfull` were computed from the *current* `g_wptr`, the flag would describe the FIFO as it was one write ago. Timeline for `DEPTH = 8` holding 7 words, no reads in progress (`g_rptr_sync` = `0000`, so the full pattern is `1100`), `w_en` held high:
 
-| Edge | Event | Flag from `g_wptr_next` (this design) | Flag from `g_wptr` (broken) |
-|---|---|---|---|
-| `k` | Write #8 accepted, `b_wptr` becomes 8 | `g_wptr_next = 1100` equals inverted `g_rptr_sync` (`1100`), so `full <= 1` | `g_wptr` is still `gray(7) = 0100`, not equal, so `full <= 0` |
-| `k+1` | `w_en` still high | `full = 1`, write is blocked, 8 words stored | `full` is sampled as `0`, so **write #9 is accepted into `mem[0]`, overwriting the oldest unread word**; `b_wptr` becomes 9. On this same edge the flag register finally loads `1` (`g_wptr` is now `1100`) |
-| `k+2` | | still full | `g_wptr` has already moved to `gray(9) = 1101`, which no longer matches `1100`, so `full <= 0`: the flag was high for a single cycle and drops while the FIFO is still full |
+| Edge | This design (`wfull` from `g_wptr_next`) | Hypothetical flag from `g_wptr` |
+|---|---|---|
+| `k` (write #8 accepted, `b_wptr` becomes 8) | `g_wptr_next` = `1100` matches, so `full <= 1` on this very edge | `g_wptr` is still `gray(7)` = `0100`, no match, so `full <= 0` |
+| `k+1` (`w_en` still high) | `full` is 1, so `b_wptr_next` holds. Exactly 8 words stored | `full` is still 0, so **write #9 is accepted into `fifo[0]` and overwrites the oldest unread word**; `b_wptr` becomes 9. The flag register now loads 1, because `g_wptr` is `1100` |
+| `k+2` | `full` stays 1 | `g_wptr` has moved to `gray(9)` = `1101`, which no longer matches, so `full <= 0`. The flag was high for one cycle and drops while the FIFO is still full |
 
-The look-ahead flag is therefore not an optimization but a correctness requirement: the single-cycle window between "pointer updated" and "flag updated" is exactly long enough for one more write to slip through, after which the pointer has moved beyond the full-detection point, the flag pulses for one cycle and releases, and the FIFO overruns continuously. This was demonstrated by mutation: changing `wfull` and `rempty` to use `g_wptr` / `g_rptr` makes the testbench report `full not asserted` and `overflow protection failed, accepted 23` (instead of 8) in the overfill phase, followed by a stream of data mismatches.
+The look-ahead flag is therefore a correctness requirement, not an optimization. The one-cycle window between "pointer updated" and "flag updated" is long enough for another write to slip through, after which the pointer has moved past the full-detection point and the FIFO keeps overflowing. With look-ahead, the flag register loads `1` on the same edge that accepts the last write, so the next write is already blocked. The same `!full` signal also guards the RAM write in `fifo_mem`, so the memory and the pointer stop on the same edge.
 
 ---
 
 ### `rptr_handler.v`
 
-**Purpose.** The mirror of `wptr_handler.v` for the read domain: binary read pointer for RAM addressing, Gray read pointer for the write side, and the registered `empty` flag.
+**Purpose.** The mirror of `wptr_handler.v` for the read domain: the binary read pointer that addresses memory, the Gray read pointer sent to the write domain, and the registered `empty` flag.
 
 ```verilog
-module rptr_handler #(
-    parameter PTR_WIDTH = 3
-) (
-    input                    rclk,
-    input                    rrst_n,
-    input                    r_en,
-    input  [PTR_WIDTH:0]     g_wptr_sync,     // write pointer, Gray, synchronized into rclk
-    output reg [PTR_WIDTH:0] b_rptr,
-    output reg [PTR_WIDTH:0] g_rptr,
-    output reg               empty
+module rptr_handler #(parameter PTR_WIDTH=3) (
+  input rclk, rrst_n, r_en,
+  input [PTR_WIDTH:0] g_wptr_sync,
+  output reg [PTR_WIDTH:0] b_rptr, g_rptr,
+  output reg empty
 );
-    wire [PTR_WIDTH:0] b_rptr_next;
-    wire [PTR_WIDTH:0] g_rptr_next;
-    wire               rempty;
 
-    assign b_rptr_next = b_rptr + (r_en & ~empty);
-    assign g_rptr_next = (b_rptr_next >> 1) ^ b_rptr_next;
+ 
+  wire [PTR_WIDTH:0] b_rptr_next;
+  wire [PTR_WIDTH:0] g_rptr_next;
+  wire               rempty;
 
-    // EMPTY: next Gray read pointer == synchronized Gray write pointer
-    assign rempty = (g_rptr_next == g_wptr_sync);
-
-    always @(posedge rclk or negedge rrst_n) begin
-        if (!rrst_n) begin
-            b_rptr <= {(PTR_WIDTH+1){1'b0}};
-            g_rptr <= {(PTR_WIDTH+1){1'b0}};
-        end else begin
-            b_rptr <= b_rptr_next;
-            g_rptr <= g_rptr_next;
-        end
+  assign b_rptr_next = b_rptr + (r_en & !empty);
+  assign g_rptr_next = (b_rptr_next >> 1) ^ b_rptr_next;
+  assign rempty      = (g_wptr_sync == g_rptr_next);
+  
+  // Pointer Registers
+  always @(posedge rclk or negedge rrst_n) begin
+    if(!rrst_n) begin
+      b_rptr <= 0;
+      g_rptr <= 0;
     end
-
-    always @(posedge rclk or negedge rrst_n) begin
-        if (!rrst_n) empty <= 1'b1;
-        else         empty <= rempty;
+    else begin
+      b_rptr <= b_rptr_next;
+      g_rptr <= g_rptr_next;
     end
+  end
+  
+  // Flag Register
+  always @(posedge rclk or negedge rrst_n) begin
+    if(!rrst_n) empty <= 1'b1;
+    else        empty <= rempty;
+  end
+
 endmodule
 ```
 
-**Logic.**
+**Pointer datapath.**
 
-- `b_rptr_next = b_rptr + (r_en & ~empty)` advances only on an accepted read, and `g_rptr_next` is the same one-XOR-per-bit Gray conversion.
-- **Empty condition:** the FIFO is empty when the read pointer has caught up with the write pointer, i.e. all `N+1` bits are equal, wrap bit included. Because Gray encoding is a bijection (distinct binary values map to distinct Gray values), binary equality is identical to Gray equality, so `rempty = (g_rptr_next == g_wptr_sync)` needs no conversion and no bit inversion. This is the asymmetry with `full`: equality is invariant under the encoding, the "differ by exactly `DEPTH`" relation is not and requires the two-bit inversion derived above.
-- **Look-ahead is mandatory here too.** `empty` is computed from `g_rptr_next` for the same reason as `full`: if the flag were derived from the current `g_rptr`, then after the pop that drains the last word at edge `k`, `empty` would still read `0` at edge `k+1`. A second pop would be accepted, `b_rptr` would move one position past `b_wptr`, and the read pointer would now sit `2 x DEPTH - 1` positions behind the write pointer in modulo arithmetic. The FIFO would present stale RAM contents as valid data (underrun) and would report an inconsistent fill level. With look-ahead, `empty <= 1` is loaded on the very edge that drains the last word, so the next pop is already blocked.
-- **Reset value is `1`.** After reset the FIFO holds nothing, and `empty` must be asserted from the first cycle so no spurious read can be accepted before the first write has propagated through the synchronizer.
-- **Staleness is safe.** `g_wptr_sync` lags the real write pointer by about three `rclk` cycles. The synchronized pointer is therefore never ahead of the true pointer, so `empty` can remain asserted briefly after data has been written (lost cycles) but can never deassert before data is actually in the RAM (no underrun).
+- `b_rptr_next = b_rptr + (r_en & !empty)` advances only when a read is requested and the FIFO is not empty. `g_rptr_next` is the same one-XOR-per-bit Gray conversion used on the write side.
+- `b_rptr` and `g_rptr` are registered together in the "Pointer Registers" block; `empty` is registered separately in the "Flag Register" block. The registered `g_rptr` is what goes to `sync_rptr` and then to the write domain.
+
+**Empty condition.** The FIFO is empty when the read pointer has caught up with the write pointer, i.e. all `N+1` bits are equal, wrap bit included. A Gray code is a bijection (distinct binary values map to distinct Gray values), so binary equality is exactly Gray equality, and `rempty = (g_wptr_sync == g_rptr_next)` needs neither a conversion nor any bit inversion. This is the asymmetry with `full`: equality is preserved by the encoding, but "differ by exactly `DEPTH`" is not, which is why `full` needs the top-two-bit inversion derived in `wptr_handler.v`.
+
+**Why look-ahead (`g_rptr_next`) is used here too.** `empty <= rempty` is a registered flag, so if `rempty` used the current `g_rptr` the flag would trail the pointer by one clock. Consider the FIFO holding exactly one word, with `g_wptr_sync` already reflecting that write and `r_en` held high:
+
+| Edge | This design (`rempty` from `g_rptr_next`) | Hypothetical flag from `g_rptr` |
+|---|---|---|
+| `k` (the read that drains the last word) | `g_rptr_next` equals `g_wptr_sync`, so `empty <= 1` on this edge | `g_rptr` is still the old value, no match, so `empty <= 0` |
+| `k+1` (`r_en` still high) | `empty` is 1, the pointer is blocked | `empty` is still 0, so a **second read is accepted**, `b_rptr` moves one past `b_wptr` |
+
+After that second read, the read pointer is ahead of the write pointer, which in modulo-`2 x DEPTH` arithmetic looks like a FIFO holding `2 x DEPTH - 1` words. The reader consumes stale RAM contents as valid data (underflow) and the flags no longer describe reality. With look-ahead, `empty` asserts on the very edge that drains the last word and the next pop is already blocked.
+
+**Reset value and staleness.**
+
+- `empty` resets to `1'b1`. After reset the FIFO holds nothing, and `empty` must be asserted from the first cycle so no read can be accepted before the first write has crossed the synchronizer.
+- `g_wptr_sync` lags the real write pointer by about three `rclk` cycles, so it is never ahead of the true pointer. `empty` can therefore stay asserted briefly after data has been written (a few lost cycles) but can never deassert before the data is in the RAM.
 
 ---
 
 ### `fifo_mem.v`
 
-**Purpose.** The shared storage array, a simple dual-port RAM with an independent clock on each port.
+**Purpose.** The shared storage array: a simple dual-port memory with a write port on `wclk` and an address-driven read on the read pointer.
 
 ```verilog
-module fifo_mem #(
-    parameter DEPTH      = 8,
-    parameter DATA_WIDTH = 8,
-    parameter PTR_WIDTH  = 3
-) (
-    input                       wclk,
-    input                       w_en,
-    input                       rclk,
-    input                       r_en,
-    input      [PTR_WIDTH:0]    b_wptr,
-    input      [PTR_WIDTH:0]    b_rptr,
-    input      [DATA_WIDTH-1:0] data_in,
-    input                       full,
-    input                       empty,
-    output reg [DATA_WIDTH-1:0] data_out
+module fifo_mem #(parameter DEPTH=8, DATA_WIDTH=8, PTR_WIDTH=3) (
+  input wclk, w_en, rclk, r_en,
+  input [PTR_WIDTH:0] b_wptr, b_rptr,
+  input [DATA_WIDTH-1:0] data_in,
+  input full, empty,
+  output wire [DATA_WIDTH-1:0] data_out
 );
-    reg [DATA_WIDTH-1:0] fifo [0:DEPTH-1];
-
-    // write port: wclk domain
-    always @(posedge wclk) begin
-        if (w_en & ~full)
-            fifo[b_wptr[PTR_WIDTH-1:0]] <= data_in;
+  reg [DATA_WIDTH-1:0] fifo[0:DEPTH-1];
+  
+  always@(posedge wclk) begin
+    if(w_en & !full) begin
+      fifo[b_wptr[PTR_WIDTH-1:0]] <= data_in;
     end
-
-    // read port: rclk domain, registered output
-    always @(posedge rclk) begin
-        if (r_en & ~empty)
-            data_out <= fifo[b_rptr[PTR_WIDTH-1:0]];
+  end
+  /*
+  always@(posedge rclk) begin
+    if(r_en & !empty) begin
+      data_out <= fifo[b_rptr[PTR_WIDTH-1:0]];
     end
+  end
+  */
+  assign data_out = fifo[b_rptr[PTR_WIDTH-1:0]];
 endmodule
 ```
 
-**Logic.**
+**Write port.** On each `wclk` edge, `if (w_en & !full)` stores `data_in` at `fifo[b_wptr[PTR_WIDTH-1:0]]`. Only the lower `PTR_WIDTH` bits of the binary pointer address the array; the MSB is the wrap bit, used by the flag logic and ignored by the RAM. The `!full` guard duplicates the pointer gating in `wptr_handler`, so the RAM and the pointer stop accepting on the same edge. The array has no reset.
 
-- The write port is clocked by `wclk` and writes `data_in` to `fifo[b_wptr[PTR_WIDTH-1:0]]` when `w_en & ~full`. The read port is clocked by `rclk`, with its output register `data_out` loaded from `fifo[b_rptr[PTR_WIDTH-1:0]]` when `r_en & ~empty`.
-- Only the lower `PTR_WIDTH` bits of each binary pointer address the array. The MSB is the wrap bit, used by the flag logic, not by the RAM.
-- The read is **registered**: `data_out` changes on the `rclk` edge that accepts the read, so the data is observable one `rclk` later. That one-cycle latency is a deliberate property (it maps to the output register of a block RAM and removes the RAM array access from the downstream timing path) and it is what the testbench scoreboard has to model.
-- The `~full` / `~empty` guards duplicate the pointer gating as a second line of defence, and double as clock-enables when mapped to block RAM.
-- No reset is applied to the array; `data_out` is `X` until the first accepted read.
+**Read path in the current source.** The active read is `assign data_out = fifo[b_rptr[PTR_WIDTH-1:0]];`, a *combinational* read, which is why `data_out` is declared `output wire` here. The registered-read `always @(posedge rclk)` block, which would load `data_out` only when `r_en & !empty`, is commented out. Consequences:
 
-**Why sharing the array between two clocks is not a CDC hazard.** The data word and the pointer that "publishes" it are written on the same `wclk` edge. The pointer then needs at least two `rclk` edges to traverse the synchronizer and one more to reach `empty`, so by the time the read domain sees `empty` go low, the RAM word has been stable for several cycles. Symmetrically, a slot can be overwritten only after the read pointer that frees it has crossed back through `sync_rptr`. Data never races its own pointer.
+- `rclk`, `r_en` and `empty` are present in the port list but unused in the active code; they are kept so the commented-out registered-read variant can be restored without changing the interface.
+- `data_out` always shows the word at the current read pointer. While `empty` is low, that is the word the next accepted read will consume (a "show-ahead" behaviour). When the read pointer advances on an accepted read, `data_out` moves to the next word right after that `rclk` edge, so a consumer must capture `data_out` on the same edge on which it asserts `r_en` and sees `empty` low.
+- When `empty` is high, `data_out` is whatever happens to be stored at `b_rptr` (possibly never written) and must not be treated as valid.
+- An asynchronous-read array maps to distributed (LUT) RAM on an FPGA. The registered-read variant, with a one-clock output register, is the form that maps to block RAM.
+
+**Why sharing the array between two clocks is not a CDC hazard.** The data word and the pointer that publishes it are updated on the same `wclk` edge. The pointer then needs two `rclk` edges to cross `sync_wptr` and one more to reach `empty`, so by the time the read side sees `empty` fall, the RAM word has been stable for several cycles. In the other direction, a slot can be overwritten only after the read pointer that frees it has crossed `sync_rptr` and let `full` deassert. Data never races its own pointer.
 
 ---
 
 ### `async_fifo_TB.v`
 
-**Purpose.** A self-checking testbench that drives the FIFO from two unrelated clocks (`wclk` = 100 MHz, `rclk` approximately 71.4 MHz), mirrors every *accepted* transaction in a scoreboard, and compares every word that leaves the DUT against the word that was expected. It ends with a `PASS` / `FAIL` summary.
+**Purpose.** A testbench that drives the FIFO from two unrelated clocks, records every word it writes in a manual array scoreboard, and compares each word read back against the scoreboard entry, printing a `PASS` or `ERROR` line per compare.
 
 ```verilog
-`timescale 1ns/1ps
+`timescale 1ns / 1ps
 
 module async_fifo_TB;
 
-    parameter DEPTH      = 8;
-    parameter DATA_WIDTH = 8;
-    parameter WCLK_HALF  = 5;       // 100 MHz write clock
-    parameter RCLK_HALF  = 7;       // ~71.4 MHz read clock
-    parameter SB_SIZE    = 8192;    // scoreboard capacity (>= total accepted writes)
+  parameter DATA_WIDTH = 8;
+  parameter SCOREBOARD_DEPTH = 128;
 
-    // ---------------- DUT interface ----------------
-    reg                   wclk, rclk;
-    reg                   wrst_n, rrst_n;
-    reg                   w_en, r_en;
-    reg  [DATA_WIDTH-1:0] data_in;
-    wire [DATA_WIDTH-1:0] data_out;
-    wire                  full, empty;
+  // Output Wires
+  wire [DATA_WIDTH-1:0] data_out;
+  wire full;
+  wire empty;
+  
+  // Input Regs
+  reg [DATA_WIDTH-1:0] data_in;
+  reg w_en, wclk, wrst_n;
+  reg r_en, rclk, rrst_n;
 
-    asynchronous_fifo #(.DEPTH(DEPTH), .DATA_WIDTH(DATA_WIDTH)) dut (
-        .wclk(wclk), .wrst_n(wrst_n),
-        .rclk(rclk), .rrst_n(rrst_n),
-        .w_en(w_en), .r_en(r_en),
-        .data_in(data_in), .data_out(data_out),
-        .full(full), .empty(empty));
+  // Pure Verilog Scoreboard Array (Replaces SystemVerilog Queue)
+  reg [DATA_WIDTH-1:0] scoreboard_mem [0:SCOREBOARD_DEPTH-1];
+  reg [7:0] sb_wr_ptr;
+  reg [7:0] sb_rd_ptr;
+  reg [DATA_WIDTH-1:0] wdata;
+  
+  // Loop Iteration Variables (Declared globally for Verilog)
+  integer i, j;
 
-    // ---------------- clocks ----------------
-    initial wclk = 1'b0;
-    always #(WCLK_HALF) wclk = ~wclk;
-    initial rclk = 1'b0;
-    always #(RCLK_HALF) rclk = ~rclk;
+  // Instantiate Design Under Test (DUT)
+  asynchronous_fifo as_fifo (
+    .wclk(wclk), .wrst_n(wrst_n),
+    .rclk(rclk), .rrst_n(rrst_n),
+    .w_en(w_en), .r_en(r_en),
+    .data_in(data_in), .data_out(data_out),
+    .full(full), .empty(empty)
+  );
 
-    // ---------------- stimulus drivers (non-blocking: race-free) ----------------
-    reg [1:0] w_mode, r_mode;       // 0 idle, 1 every cycle, 2 random 50 %, 3 random 75 %
+  // Clock Generation
+  always #5   wclk = ~wclk; // 10ns cycle period
+  always #17  rclk = ~rclk; // 34ns cycle period
+  
+  //------------------------------------------------
+  // WRITE STIMULUS DOMAIN
+  //------------------------------------------------
+  initial begin
+    wclk = 1'b0; wrst_n = 1'b0;
+    w_en = 1'b0;
+    data_in = 0;
+    sb_wr_ptr = 0;
+    
+    repeat(10) @(posedge wclk);
+    wrst_n = 1'b1;
 
-    always @(posedge wclk) begin
-        data_in <= $random;
-        case (w_mode)
-            2'd1:    w_en <= 1'b1;
-            2'd2:    w_en <= ({$random} % 4) < 2;
-            2'd3:    w_en <= ({$random} % 4) < 3;
-            default: w_en <= 1'b0;
-        endcase
-    end
-
-    always @(posedge rclk) begin
-        case (r_mode)
-            2'd1:    r_en <= 1'b1;
-            2'd2:    r_en <= ({$random} % 4) < 2;
-            2'd3:    r_en <= ({$random} % 4) < 3;
-            default: r_en <= 1'b0;
-        endcase
-    end
-
-    // ---------------- scoreboard ----------------
-    reg [DATA_WIDTH-1:0] scoreboard_mem [0:SB_SIZE-1];
-    integer              sb_wptr, sb_rptr;
-    integer              errors, checked;
-    reg                  rd_check_pending;
-    reg [DATA_WIDTH-1:0] rd_expected;
-
-    // record every ACCEPTED write
-    always @(posedge wclk) begin
-        if (wrst_n && w_en && !full) begin
-            scoreboard_mem[sb_wptr] <= data_in;
-            sb_wptr                 <= sb_wptr + 1;
+    for (j=0; j<2; j=j+1) begin
+      for (i=0; i<30; i=i+1) begin
+        @(posedge wclk);
+        if (!full) begin
+          w_en <= (i%2 == 0) ? 1'b1 : 1'b0;
+          if (i%2 == 0) begin
+            // Verilog random data generation
+            data_in <= $random; 
+            scoreboard_mem[sb_wr_ptr] = $random; // Store directly for matching
+            sb_wr_ptr = sb_wr_ptr + 1;
+          end
+        end else begin
+          w_en <= 1'b0;
         end
+      end
+      #50;
     end
+  end
 
-    // accepted read: stage 1 captures expectation, stage 2 (next rclk) compares
-    always @(posedge rclk) begin
-        if (rd_check_pending) begin
-            checked = checked + 1;
-            if (data_out !== rd_expected) begin
-                errors = errors + 1;
-                $display("[%0t] ERROR: mismatch expected=%h got=%h", $time, rd_expected, data_out);
-            end
-        end
+  //------------------------------------------------
+  // READ STIMULUS & VERIFICATION DOMAIN
+  //------------------------------------------------
+  initial begin
+    rclk = 1'b0; rrst_n = 1'b0;
+    r_en = 1'b0;
+    sb_rd_ptr = 0;
 
-        rd_check_pending <= 1'b0;
-        if (rrst_n && r_en && !empty) begin
-            if (sb_rptr >= sb_wptr) begin
-                errors = errors + 1;
-                $display("[%0t] ERROR: underrun, read accepted but scoreboard is empty", $time);
+    repeat(20) @(posedge rclk);
+    rrst_n = 1'b1;
+
+    for (j=0; j<2; j=j+1) begin
+      for (i=0; i<30; i=i+1) begin
+        @(posedge rclk);
+        if (!empty) begin
+          r_en <= (i%2 == 0) ? 1'b1 : 1'b0;
+          
+          if (i%2 == 0) begin
+            // Fetch validation target data from memory array
+            wdata = scoreboard_mem[sb_rd_ptr];
+            sb_rd_ptr = sb_rd_ptr + 1;
+            
+            // Wait 1 read clock cycle for RAM array lookup latency
+            @(posedge rclk); 
+            #1; // Delay past hold time window
+            
+            if (data_out !== wdata) begin
+              $display("ERROR at %0t ns: Expected = %h, Got = %h", $time, wdata, data_out);
             end else begin
-                rd_expected      <= scoreboard_mem[sb_rptr];
-                sb_rptr          <= sb_rptr + 1;
-                rd_check_pending <= 1'b1;
+              $display("PASS at %0t ns: Read data successfully matches written data (%h)", $time, data_out);
             end
+          end
+        end else begin
+          r_en <= 1'b0;
         end
+      end
+      #50;
     end
 
-    // ---------------- helpers ----------------
-    task drain;
-        begin
-            @(negedge rclk); r_mode = 2'd1;
-            while (sb_rptr != sb_wptr) @(posedge rclk);
-            repeat (6) @(posedge rclk);          // keep r_en high on empty, flush last compare
-            @(negedge rclk); r_mode = 2'd0;
-            repeat (3) @(posedge rclk);
-        end
-    endtask
-
-    // ---------------- sequencer ----------------
-    initial begin
-        $dumpfile("async_fifo.vcd");
-        $dumpvars(0, async_fifo_TB);
-
-        sb_wptr = 0; sb_rptr = 0; errors = 0; checked = 0;
-        rd_check_pending = 1'b0; rd_expected = 0;
-        w_mode = 0; r_mode = 0; w_en = 0; r_en = 0; data_in = 0;
-        wrst_n = 1'b0; rrst_n = 1'b0;
-
-        repeat (4) @(negedge wclk);  wrst_n = 1'b1;
-        repeat (4) @(negedge rclk);  rrst_n = 1'b1;
-
-        // PHASE 1: overfill (3x capacity attempted, DEPTH must be accepted)
-        @(negedge wclk); w_mode = 2'd1;
-        repeat (3*DEPTH) @(posedge wclk);
-        @(negedge wclk); w_mode = 2'd0;
-        repeat (4) @(posedge wclk);
-        if (full !== 1'b1)      begin errors = errors + 1; $display("ERROR: full not asserted"); end
-        if (sb_wptr != DEPTH)   begin errors = errors + 1; $display("ERROR: overflow protection failed, accepted %0d", sb_wptr); end
-
-        // PHASE 2: drain, with underflow attempts while empty
-        drain;
-        if (empty !== 1'b1)     begin errors = errors + 1; $display("ERROR: empty not asserted"); end
-        if (sb_rptr != DEPTH)   begin errors = errors + 1; $display("ERROR: underflow protection failed"); end
-
-        // PHASE 3: write-heavy random traffic (75 % write @100 MHz vs 50 % read @71 MHz)
-        @(negedge wclk); w_mode = 2'd3;
-        @(negedge rclk); r_mode = 2'd2;
-        repeat (3000) @(posedge wclk);
-        @(negedge wclk); w_mode = 2'd0;
-        drain;
-
-        // PHASE 4: read-heavy random traffic (50 % write vs continuous read)
-        @(negedge wclk); w_mode = 2'd2;
-        @(negedge rclk); r_mode = 2'd1;
-        repeat (3000) @(posedge wclk);
-        @(negedge wclk); w_mode = 2'd0;
-        drain;
-
-        $display("--------------------------------------------------");
-        $display(" words written : %0d", sb_wptr);
-        $display(" words read    : %0d", sb_rptr);
-        $display(" words compared: %0d", checked);
-        $display(" errors        : %0d", errors);
-        if (errors == 0 && checked == sb_wptr && sb_wptr == sb_rptr)
-            $display(" RESULT: PASS");
-        else
-            $display(" RESULT: FAIL");
-        $display("--------------------------------------------------");
-        $finish;
-    end
-
-    initial begin
-        #5_000_000;
-        $display("[%0t] ERROR: watchdog expired", $time);
-        $finish;
-    end
+    $display("[TEST COMPLETE] Validation sequence ended.");
+    $finish;
+  end
+  
+  // Waveform Dump Configuration
+  initial begin 
+    $dumpfile("dump.vcd"); 
+    $dumpvars(0, async_fifo_TB);
+  end
 
 endmodule
 ```
 
-**Stimulus and race avoidance.**
+**Structure and clocks.**
 
-- Clock generators use half-period parameters (`WCLK_HALF`, `RCLK_HALF`), so any ratio can be tested by editing two numbers.
-- `w_mode` / `r_mode` select idle, every-cycle, 50 % random or 75 % random enables. The driver blocks use **non-blocking assignments** at `posedge`, so every DUT or monitor process that samples at the same edge sees the *pre-edge* values; the testbench therefore cannot race the design. The sequencer changes modes on the falling edge for the same reason, and resets are released on a falling edge so reset recovery is never violated.
-- Enables are driven irrespective of `full` / `empty` on purpose. The testbench keeps `w_en` high while the FIFO is full and `r_en` high while it is empty, to prove that the RTL itself rejects those requests.
+- The DUT is instantiated as `as_fifo` with named port connections and default parameters (`DEPTH = 8`, `DATA_WIDTH = 8`).
+- `always #5 wclk = ~wclk;` gives a 10 ns write clock (100 MHz). `always #17 rclk = ~rclk;` gives a 34 ns read clock (about 29.4 MHz). The write side is roughly 3.4 times faster, so a continuous writer outruns the reader and exercises `full`.
+- `full`, `empty` and `data_out` are declared `wire` because the DUT drives them; `wclk`, `rclk`, `w_en`, `r_en`, `data_in` and the resets are `reg` because the testbench assigns them procedurally. This is the same net-versus-variable rule that makes `full` and `empty` `wire` in `asynchronous_fifo.v`.
+- The initial blocks hold each domain in reset for a different number of its own cycles (10 `wclk` cycles, 20 `rclk` cycles) before releasing it, so the two resets are released independently.
 
-**Why a scoreboard array with manual pointers.** The scoreboard is an independent golden model: `scoreboard_mem[0:SB_SIZE-1]` with a manual write index `sb_wptr` and read index `sb_rptr`. This matters for several reasons:
+**Write stimulus.** Two passes of 30 iterations. On even `i` with `full` low, `w_en <= 1` and `data_in` is updated, and a scoreboard entry is stored at `scoreboard_mem[sb_wr_ptr]` before `sb_wr_ptr` is incremented. On odd `i`, `w_en <= 0`. The result is one write pulse every two `wclk` cycles, 15 per pass. If `full` is high the iteration only drives `w_en <= 0`. `w_en` and `data_in` are driven with non-blocking assignments, so the DUT samples pre-edge values and those inputs cannot race the design.
 
-- *Independence.* The model shares no code, pointer format or flag logic with the DUT. If the expected data came from the same Gray-pointer arithmetic that is being verified, a bug could cancel out; an array indexed by plain integers cannot be fooled by the same defect.
-- *Only accepted transactions are recorded.* A write enters the scoreboard only when `w_en && !full` is true at the edge, and a read consumes an entry only when `r_en && !empty`. Requests that the DUT is *supposed* to reject therefore never enter the model, so any overflow that corrupts the FIFO shows up as a data mismatch, and any underrun triggers the explicit check `sb_rptr >= sb_wptr`.
-- *Order checking.* A FIFO's contract is ordering. The scoreboard is an append-and-consume structure, so word `n` out must equal word `n` in, which also detects loss, duplication and reordering.
-- *Occupancy visibility.* `sb_wptr - sb_rptr` is the true fill level and is visible in the waveform next to `full` and `empty`, which makes flag debugging direct.
-- *Portability.* A manual array works in any Verilog-2001 simulator, with no dependency on SystemVerilog queues.
-- *Capacity.* `SB_SIZE` must exceed the total number of accepted writes in a run (about 2570 here, against 8192 entries), since the indices are not wrapped.
+**Why a manual array scoreboard (`scoreboard_mem`, `sb_wr_ptr`, `sb_rd_ptr`).**
 
-**Why the compare is delayed by one clock.** `fifo_mem` has a registered read: when a read is accepted on `rclk` edge `n`, `data_out` is loaded by non-blocking assignment at that edge and holds the new word only after it. Comparing `data_out` in the same edge that accepts the read would sample the *previous* read's value (or `X` after reset), which produces false mismatches even though the DUT is correct. The monitor therefore uses two stages:
+- *Golden reference independent of the DUT.* `scoreboard_mem[0:SCOREBOARD_DEPTH-1]` is indexed by plain counters. It shares no Gray-pointer arithmetic, wrap-bit logic or flag logic with the FIFO, so a bug in the design cannot also corrupt the expected data.
+- *Ordering check.* A FIFO's contract is ordering. `sb_wr_ptr` marks the next free scoreboard slot and `sb_rd_ptr` marks the next entry to be consumed, so the Nth word read from the FIFO is checked against the Nth word written. Loss, duplication and reordering all show up as mismatches.
+- *Fill-level visibility.* `sb_wr_ptr - sb_rd_ptr` is the true occupancy, which can be placed in the waveform beside `full` and `empty` when debugging flags.
+- *Portability.* The comment in the file notes that the array replaces a SystemVerilog queue, so the testbench runs in any plain-Verilog simulator. The cost is that the indices are 8-bit (`reg [7:0]`) and the array has 128 entries, so a run must store fewer than 128 entries (the 8-bit index would otherwise exceed the array). This stimulus stores at most 30.
 
-1. **Stage 1 (edge `n`, accepted read):** fetch `scoreboard_mem[sb_rptr]` into `rd_expected`, increment `sb_rptr`, and set `rd_check_pending`.
-2. **Stage 2 (edge `n+1`):** if `rd_check_pending` is set, compare `data_out` with `rd_expected` using `!==` (so `X` and `Z` also fail).
+**Read stimulus and the one-clock delay before `data_out` is read.** Also two passes of 30 iterations. On even `i` with `empty` low, the read side:
 
-During back-to-back reads the pending flag is re-armed every cycle, so the compare pipeline sustains one word per `rclk` with the expected data lined up behind the RAM output. The drain task keeps `r_en` high for six extra cycles after the last accepted read so that the final compare completes and the underflow-protection path is exercised. This was verified by mutation: collapsing the two stages into one compare at the accepting edge turns a clean run into 2559 false errors out of 2567 words.
+1. drives `r_en <= 1`, fetches `wdata = scoreboard_mem[sb_rd_ptr]` and increments `sb_rd_ptr`;
+2. executes `@(posedge rclk); #1;`, an explicit one-`rclk` wait followed by 1 ns;
+3. compares `data_out` with `wdata` using `!==`, so `X` and `Z` also count as mismatches, and prints `PASS` or `ERROR`.
 
-**Test phases.**
+The wait in step 2 is there to model memory read latency. In a registered-read memory (the commented-out block in `fifo_mem.v`), a read accepted on `rclk` edge `n` loads `data_out` by non-blocking assignment at that edge, so the word is observable only after the edge. Comparing in the same time step as the accepting edge would sample the *previous* read's value (or `X` after reset) and flag a correct DUT as failing. Waiting for the next `rclk` edge and then 1 ns lets all non-blocking updates from that edge settle (the 1 ns is the file's "delay past the hold-time window"), and the sampled value is then stable.
 
-| Phase | Stimulus | What it proves |
-|---|---|---|
-| Reset | Domains released on different falling edges | Reset values (`full = 0`, `empty = 1`) and independent reset release |
-| 1: Overfill | `w_en` held high for `3 x DEPTH` cycles, no reads | Exactly `DEPTH` writes accepted (`sb_wptr == DEPTH`), `full` asserted, overflow rejected |
-| 2: Drain | `r_en` held high until the scoreboard is empty, plus 6 extra cycles | All `DEPTH` words in order, `empty` asserted, underflow rejected (`sb_rptr == DEPTH`) |
-| 3: Write-heavy random | 75 % write @ 100 MHz vs 50 % read @ ~71 MHz, 3000 `wclk` cycles | Sustained `full` back-pressure, pointer wrap-around, `g_rptr_sync` staleness handling |
-| 4: Read-heavy random | 50 % write vs continuous read, 3000 `wclk` cycles | Sustained `empty` operation, `g_wptr_sync` staleness handling, simultaneous push and pop |
+**Alignment between this testbench and the current RTL.** Reading the code as it stands, four points do not line up and will affect what the testbench reports. They are worth fixing before relying on the `PASS` / `ERROR` output:
 
-A watchdog (`#5_000_000`) terminates a hung simulation. The pass criterion is `errors == 0`, every word written was read (`sb_wptr == sb_rptr`) and every word read was compared (`checked == sb_wptr`).
+- *Different random values in `data_in` and the scoreboard.* The write loop calls `$random` twice: `data_in <= $random;` and `scoreboard_mem[sb_wr_ptr] = $random;`. Each call returns the next number in the sequence, so the scoreboard holds a different value than the one written into the FIFO. Using a single `$random` call stored in a temporary (the declared `wdata` is read-side only, so a separate variable is cleaner) and assigning it to both places removes this mismatch.
+- *`r_en` stays high for two `rclk` edges per scoreboard entry.* `r_en <= 1` is issued on the even iteration, but the inner `@(posedge rclk)` consumes an extra edge before the odd iteration clears it. `rptr_handler` therefore samples `r_en = 1` on two consecutive edges and can advance `b_rptr` twice for every single `sb_rd_ptr` increment, so the scoreboard and the DUT drift apart.
+- *The wait matches a registered read, but the active read is combinational.* With `assign data_out = fifo[b_rptr[...]]`, the accepting edge has already moved `b_rptr` by the time the `#1` expires, so the sampled `data_out` is the word *after* the one just read. Either restore the registered-read block in `fifo_mem.v` (which the one-clock delay was written for) or, for the combinational read, compare `data_out` at the accepting edge, before the pointer moves.
+- *The testbench never holds `w_en` high through a sustained full condition.* The write loop checks `!full` before every pulse, so the FIFO's own overflow guard (`w_en & !full` inside `wptr_handler` and `fifo_mem`) is at most touched for a single edge by this stimulus. Holding `w_en` high while `full` is asserted, and likewise `r_en` while `empty` is asserted, is what proves those guards.
 
----
-
-## 3. Verification Evidence
-
-Clean run (Icarus Verilog, `-g2005 -Wall`):
-
-| Metric | Result |
-|---|---|
-| Words written / read / compared | 2567 / 2567 / 2567 |
-| Errors | 0 |
-| Clock ratio | 100 MHz write, ~71.4 MHz read (swap `WCLK_HALF` / `RCLK_HALF` to test the reverse) |
-
-Mutation checks that confirm each design decision is load-bearing:
-
-| Mutation | Observed result |
-|---|---|
-| `full` / `empty` declared `output reg` in `asynchronous_fifo.v` | Elaboration fails: `reg full; cannot be driven by primitives or continuous assignment` |
-| Flags computed from `g_wptr` / `g_rptr` instead of `_next` | `full` never asserts correctly, 23 writes accepted into an 8-deep FIFO, repeated data mismatches |
-| Scoreboard compare at the accepting edge (no 1-clock delay) | 2559 false mismatches in 2567 reads |
-
-Note that zero-delay RTL simulation cannot expose metastability or bus skew, so the synchronizer and Gray-code argument in `synchronizer.v` is established by construction and by constraints (`ASYNC_REG`, max-delay and bus-skew limits), not by this testbench. Gate-level simulation with SDF, or a CDC lint tool, should complement it before tape-out or release.
+I could not run a simulator when preparing this README, so the findings above are from reading the source; confirm them in your own simulation. The run ends with `[TEST COMPLETE] Validation sequence ended.` followed by `$finish`; the testbench has no summary counter and no watchdog, so scan the log for `ERROR` lines.
